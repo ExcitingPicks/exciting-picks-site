@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>Exciting Picks</title>
     <meta
       name="description"
@@ -174,6 +177,7 @@
   bindEvents();
   drawLoadingFrame();
   initializePoster();
+  checkForPublishedUpdate();
 
   function bindEvents() {
     elements.form.addEventListener("input", syncStateFromForm);
@@ -455,6 +459,40 @@
       document.fonts.load('80px "Druk Heavy"'),
       document.fonts.load('68px "Druk Heavy"')
     ]);
+  }
+
+  async function checkForPublishedUpdate() {
+    if (!config.updatedAt || typeof fetch !== "function") {
+      return;
+    }
+
+    try {
+      const refreshUrl = new URL(window.location.href);
+      refreshUrl.searchParams.set("fresh", String(Date.now()));
+
+      const response = await fetch(refreshUrl.toString(), { cache: "no-store" });
+      if (!response.ok) {
+        return;
+      }
+
+      const html = await response.text();
+      const match = html.match(/window\.EXCITING_PICKS_CONFIG = (\{[\s\S]*?\});/);
+      if (!match) {
+        return;
+      }
+
+      const latestConfig = JSON.parse(match[1]);
+      if (!latestConfig.updatedAt || latestConfig.updatedAt === config.updatedAt) {
+        return;
+      }
+
+      const latestUrl = new URL(window.location.href);
+      latestUrl.searchParams.delete("fresh");
+      latestUrl.searchParams.set("v", latestConfig.updatedAt);
+      window.location.replace(latestUrl.toString());
+    } catch (error) {
+      console.warn("Could not check for a newer published build.", error);
+    }
   }
 
   async function exportCanvasBlob(canvas) {
