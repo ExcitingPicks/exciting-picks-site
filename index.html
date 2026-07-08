@@ -176,6 +176,8 @@
   const photoshopScale = 144 / 72;
   const fontStack = '"Druk Heavy", Impact, "Arial Narrow Bold", sans-serif';
   const demoBoard = config.demoBoard || {};
+  const bannedPhrases = Array.isArray(config.bannedPhrases) ? config.bannedPhrases : [];
+  const moderationMatcher = buildModerationMatcher(bannedPhrases);
   const defaults = {
     name: demoBoard.name || "Jane Fan",
     handle: demoBoard.handle || "janefan",
@@ -217,7 +219,11 @@
     picks: defaults.picks.slice(),
     headshotImage: null,
     headshotObjectUrl: "",
-    ready: false
+    ready: false,
+    hasBlockedInput: false,
+    validationMessage: "",
+    statusMessage: "",
+    isExporting: false
   };
   const touched = {
     name: false,
@@ -256,7 +262,10 @@
   elements.topicValue.textContent = state.topic;
 
   hydrateForm();
+  resetValidationState();
   bindEvents();
+  updateDownloadButtonState();
+  renderStatus();
   drawLoadingFrame();
   initializePoster();
   checkForPublishedUpdate();
@@ -303,11 +312,46 @@
   }
 
   function syncStateFromForm() {
-    state.name = resolveFieldValue(elements.nameInput.value, defaults.name, touched.name);
-    state.handle = resolveFieldValue(elements.handleInput.value, defaults.handle, touched.handle);
-    state.picks = elements.pickInputs.map((input, index) => (
-      resolveFieldValue(input.value, defaults.picks[index], touched.picks[index])
+    const nameResult = resolveModeratedFieldValue({
+      input: elements.nameInput,
+      fallbackValue: defaults.name,
+      isTouched: touched.name
+    });
+    const handleResult = resolveModeratedFieldValue({
+      input: elements.handleInput,
+      fallbackValue: defaults.handle,
+      isTouched: touched.handle
+    });
+    const pickResults = elements.pickInputs.map((input, index) => (
+      resolveModeratedFieldValue({
+        input,
+        fallbackValue: defaults.picks[index],
+        isTouched: touched.picks[index]
+      })
     ));
+
+    state.name = nameResult.value;
+    state.handle = handleResult.value;
+    state.picks = pickResults.map((result) => result.value);
+
+    updateValidationState([
+      {
+        input: elements.nameInput,
+        label: "Name",
+        blockedPhrase: nameResult.blockedPhrase
+      },
+      {
+        input: elements.handleInput,
+        label: "Handle",
+        blockedPhrase: handleResult.blockedPhrase
+      },
+      ...pickResults.map((result, index) => ({
+        input: elements.pickInputs[index],
+        label: `Pick ${index + 1}`,
+        blockedPhrase: result.blockedPhrase
+      }))
+    ]);
+
     renderPoster();
   }
 
@@ -319,13 +363,20 @@
     touched.handle = false;
     touched.picks.fill(false);
     hydrateForm();
+    resetValidationState();
     clearHeadshot({ preserveStatus: true });
     renderPoster();
     setStatus("");
   }
 
   async function downloadPoster() {
-    elements.downloadButton.disabled = true;
+    if (state.hasBlockedInput) {
+      setStatus("Please remove blocked language before downloading.");
+      return;
+    }
+
+    state.isExporting = true;
+    updateDownloadButtonState();
     setStatus("Preparing PNG...");
 
     try {
@@ -351,7 +402,8 @@
     } catch (error) {
       setStatus("Could not export the PNG.");
     } finally {
-      elements.downloadButton.disabled = false;
+      state.isExporting = false;
+      updateDownloadButtonState();
     }
   }
 
@@ -674,9 +726,22 @@
     }
   }
 
-  function resolveFieldValue(inputValue, fallbackValue, isTouched) {
-    const normalized = normalizeValue(inputValue);
-    return isTouched ? normalized : fallbackValue;
+  function resolveModeratedFieldValue(options) {
+    const { input, fallbackValue, isTouched } = options;
+    const normalized = normalizeValue(input.value);
+
+    if (!isTouched) {
+      return {
+        value: fallbackValue,
+        blockedPhrase: ""
+      };
+    }
+
+    const blockedPhrase = findBlockedPhrase(input.value);
+    return {
+      value: blockedPhrase ? "" : normalized,
+      blockedPhrase
+    };
   }
 
   async function handleHeadshotSelection(event) {
@@ -794,6 +859,83 @@
       .trim();
   }
 
+  function buildModerationMatcher(phrases) {
+    const tokenSets = new Map();
+    const symbolPhrases = [];
+
+    phrases.forEach((phrase) => {
+      const normalizedPhrase = normalizeModerationText(phrase);
+      const phraseTokens = tokenizeModerationText(phrase);
+
+      if (phraseTokens.length > 0) {
+        const tokenCount = phraseTokens.length;
+        if (!tokenSets.has(tokenCount)) {
+          tokenSets.set(tokenCount, new Set());
+        }
+        tokenSets.get(tokenCount).add(phraseTokens.join(" "));
+        return;
+      }
+
+      if (normalizedPhrase) {
+        symbolPhrases.push(normalizedPhrase);
+      }
+    });
+
+    return {
+      tokenSets,
+      tokenCounts: Array.from(tokenSets.keys()).sort((left, right) => right - left),
+      symbolPhrases
+    };
+  }
+
+  function findBlockedPhrase(value) {
+    const normalized = normalizeModerationText(value);
+    if (!normalized) {
+      return "";
+    }
+
+    const matchedSymbolPhrase = moderationMatcher.symbolPhrases.find((phrase) => (
+      normalized.includes(phrase)
+    ));
+    if (matchedSymbolPhrase) {
+      return matchedSymbolPhrase;
+    }
+
+    const tokens = tokenizeModerationText(value);
+    if (tokens.length === 0) {
+      return "";
+    }
+
+    for (let index = 0; index < tokens.length; index += 1) {
+      for (const tokenCount of moderationMatcher.tokenCounts) {
+        if (index + tokenCount > tokens.length) {
+          continue;
+        }
+
+        const candidate = tokens.slice(index, index + tokenCount).join(" ");
+        const tokenSet = moderationMatcher.tokenSets.get(tokenCount);
+        if (tokenSet && tokenSet.has(candidate)) {
+          return candidate;
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function normalizeModerationText(value) {
+    return String(value || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function tokenizeModerationText(value) {
+    return normalizeModerationText(value).match(/[a-z0-9]+/g) || [];
+  }
+
   function buildFilename() {
     const base = slugify(config.downloadPrefix || "exciting-picks");
     const topic = slugify(state.topic);
@@ -810,8 +952,53 @@
       .slice(0, 60);
   }
 
+  function updateValidationState(results) {
+    const blockedResults = results.filter((result) => Boolean(result.blockedPhrase));
+    state.hasBlockedInput = blockedResults.length > 0;
+    state.validationMessage = blockedResults.length > 0
+      ? `Please remove blocked language from ${blockedResults[0].label}.`
+      : "";
+
+    results.forEach((result) => {
+      applyFieldValidation(result.input, Boolean(result.blockedPhrase));
+    });
+
+    updateDownloadButtonState();
+    renderStatus();
+  }
+
+  function resetValidationState() {
+    state.hasBlockedInput = false;
+    state.validationMessage = "";
+    [
+      elements.nameInput,
+      elements.handleInput,
+      ...elements.pickInputs
+    ].forEach((input) => {
+      applyFieldValidation(input, false);
+    });
+    updateDownloadButtonState();
+    renderStatus();
+  }
+
+  function applyFieldValidation(input, isInvalid) {
+    input.setAttribute("aria-invalid", isInvalid ? "true" : "false");
+  }
+
+  function updateDownloadButtonState() {
+    elements.downloadButton.disabled = state.isExporting || state.hasBlockedInput;
+  }
+
+  function renderStatus() {
+    elements.statusText.classList.toggle("status-text--error", state.hasBlockedInput);
+    elements.statusText.textContent = state.hasBlockedInput
+      ? state.validationMessage
+      : state.statusMessage;
+  }
+
   function setStatus(message) {
-    elements.statusText.textContent = message;
+    state.statusMessage = message;
+    renderStatus();
   }
 })();
     </script>
